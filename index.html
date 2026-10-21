@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Shop</title>
+<style>
+  :root { --ink:#111; --muted:#666; --line:#e5e5e5; --brand:#1a56db; --ok:#0a7f3f; --bad:#b42318; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:var(--ink); background:#f6f7f9; display:flex; justify-content:center; padding:24px 16px; }
+  .card { width:100%; max-width:420px; background:#fff; border:1px solid var(--line); border-radius:14px; padding:22px; }
+  h1 { font-size:19px; margin:0 0 4px; }
+  .sub { font-size:13px; color:var(--muted); margin-bottom:16px; }
+  .item { display:flex; justify-content:space-between; align-items:center; padding:12px 0; border-top:1px solid var(--line); }
+  .item small { color:var(--muted); display:block; }
+  .qty { display:flex; align-items:center; gap:10px; }
+  .qty button { width:32px; height:32px; border-radius:50%; border:1px solid var(--line); background:#fff; font-size:18px; cursor:pointer; padding:0; }
+  .qty span { min-width:22px; text-align:center; font-variant-numeric:tabular-nums; }
+  .total { display:flex; justify-content:space-between; font-size:18px; font-weight:700; padding:14px 0; border-top:1px solid var(--line); }
+  label { font-size:13px; color:var(--muted); }
+  input { width:100%; font-size:17px; padding:12px; border:1px solid var(--line); border-radius:8px; margin:6px 0 14px; }
+  .btn, button.main { display:block; width:100%; text-align:center; font-size:16px; padding:13px; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; text-decoration:none; }
+  button.main:disabled { opacity:.5; cursor:default; }
+  .center { text-align:center; }
+  #qr { width:220px; height:220px; margin:8px auto; display:block; }
+  .amount { font-size:30px; font-weight:700; margin:4px 0; }
+  .hint { font-size:13px; color:var(--muted); margin:6px 0 12px; }
+  .warn { background:#fff8e1; border:1px solid #f5d76e; border-radius:8px; padding:10px; font-size:13px; margin:12px 0; text-align:left; }
+  .status { margin-top:12px; font-size:14px; color:var(--muted); }
+  .ok { color:var(--ok); font-weight:600; } .bad { color:var(--bad); font-weight:600; }
+  .tick { font-size:56px; color:var(--ok); }
+  .hidden { display:none; }
+  .summary { text-align:left; font-size:14px; margin:12px 0; }
+  .summary div { display:flex; justify-content:space-between; padding:3px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+
+  <!-- STEP 1: cart -->
+  <div id="step-cart">
+    <h1>Print Shop</h1>
+    <div class="sub">Choose what you need, then pay by UPI.</div>
+    <div id="items"><div class="status">Loading items…</div></div>
+    <div class="total"><span>Total</span><span id="total">₹0</span></div>
+    <label for="mobile">Mobile number</label>
+    <input id="mobile" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile">
+    <button id="checkoutBtn" class="main" disabled>Pay</button>
+    <div id="err" class="status bad"></div>
+  </div>
+
+  <!-- STEP 2: pay -->
+  <div id="step-pay" class="center hidden">
+    <div class="hint">Pay exactly</div>
+    <div class="amount" id="exact"></div>
+    <img id="qr" alt="UPI QR code">
+    <a id="upiLink" class="btn" href="#">Open UPI app</a>
+    <div class="warn">Pay the <b>exact amount</b> shown, including paise. A different amount can't be matched automatically.</div>
+    <div class="status">Waiting for payment… <span id="timer"></span></div>
+  </div>
+
+  <!-- STEP 3: done -->
+  <div id="step-done" class="center hidden">
+    <div class="tick">✓</div>
+    <div class="ok">Payment received</div>
+    <div class="summary" id="doneSummary"></div>
+    <button class="main" id="newBtn">New order</button>
+  </div>
+
+  <!-- expired -->
+  <div id="step-expired" class="center hidden">
+    <div class="bad">Payment window expired</div>
+    <div class="hint">If you already paid, contact us with your UTR.</div>
+    <button class="main" id="retryBtn">Try again</button>
+  </div>
+</div>
+
+<script>
+/* ===== CONFIG ===== */
+const WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzfQYuqNk_YdOvb2q9rh5EovJ_WHfwVqMrIwoT1-21U-EgzhVoSpliRfkawKz1X3WI0Zw/exec';
+const POLL_MS = 4000;
+
+/* ===== helpers ===== */
+const $ = id => document.getElementById(id);
+const show = n => ['cart','pay','done','expired'].forEach(s => $('step-'+s).classList.toggle('hidden', s !== n));
+const money = n => '₹' + (Math.round(n * 100) / 100).toString();
+const label = it => it.name || it.sku.replace(/_/g, ' ');
+const validMobile = () => /^[6-9]\d{9}$/.test($('mobile').value.trim());
+
+async function api(params) {
+  const r = await fetch(WEB_APP_URL + '?' + new URLSearchParams(params));
+  return r.json();
+}
+const save = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch (_) {} };
+const load = k => { try { return JSON.parse(localStorage.getItem(k)); } catch (_) { return null; } };
+
+let items = [], qty = {}, order = null, cartItems = [], cartTotal = 0, pollTimer = null, tickTimer = null;
+
+/* ===== STEP 1: cart ===== */
+async function loadItems() {
+  try {
+    const r = await api({ action: 'prices' });
+    if (!r.ok) throw new Error(r.error);
+    items = r.items; items.forEach(i => qty[i.sku] = 0);
+    renderItems();
+  } catch (e) { $('items').innerHTML = '<div class="status bad">Could not load items. Refresh to retry.</div>'; }
+}
+
+function renderItems() {
+  $('items').innerHTML = '';
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML = `<div>${label(it)}<small>${money(it.price)} each</small></div>
+      <div class="qty"><button data-d="-1">−</button><span id="q-${it.sku}">0</span><button data-d="1">+</button></div>`;
+    row.querySelectorAll('button').forEach(b => b.onclick = () => change(it.sku, +b.dataset.d));
+    $('items').appendChild(row);
+  });
+  update();
+}
+
+function change(sku, d) {
+  qty[sku] = Math.max(0, Math.min(500, (qty[sku] || 0) + d));
+  $('q-' + sku).textContent = qty[sku];
+  update();
+}
+
+function update() {
+  const total = items.reduce((s, it) => s + it.price * (qty[it.sku] || 0), 0);
+  $('total').textContent = money(total);
+  $('checkoutBtn').disabled = total < 1;
+  $('checkoutBtn').textContent = total >= 1 ? 'Pay ' + money(total) : 'Pay';
+}
+
+/* ===== STEP 2: cart -> order -> QR ===== */
+$('checkoutBtn').onclick = async () => {
+  $('err').textContent = '';
+  if (!validMobile()) { $('err').textContent = 'Enter a valid 10-digit mobile number'; return; }
+  const chosen = items.filter(i => qty[i.sku] > 0).map(i => ({ sku: i.sku, qty: qty[i.sku] }));
+  $('checkoutBtn').disabled = true;
+  try {
+    save('mobile', $('mobile').value.trim());
+    const c = await api({ action: 'cart', mobile: $('mobile').value.trim(), items: JSON.stringify(chosen) });
+    if (!c.ok) throw new Error(c.error || 'Could not create cart');
+    cartItems = c.items; cartTotal = c.total;               // server-computed prices
+    const o = await api({ action: 'create', cart_id: c.cart_id });
+    if (!o.ok) throw new Error(o.error || 'Could not create payment');
+    order = o;
+    save('pending', { order: o, items: c.items, total: c.total });
+    showPay(o);
+  } catch (e) { $('err').textContent = e.message; update(); }
+};
+
+function showPay(o) {
+  $('exact').textContent = '₹' + o.amount;
+  $('qr').src = o.qr_url;
+  $('upiLink').href = o.upi_link;
+  show('pay');
+  startTimer(new Date(o.expires_at));
+  startPolling();
+}
+
+/* ===== STEP 3: poll, then fulfill ===== */
+function startPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    if (document.hidden || !order) return;
+    try {
+      const s = await api({ action: 'status', order_id: order.order_id });
+      if (s.status === 'PAID' || s.status === 'PAID_LATE') {
+        stop();
+        let job = null;
+        try { const f = await api({ action: 'fulfill', order_id: order.order_id }); if (f.ok) job = f.job_id; } catch (_) {}
+        done(s, job);
+      } else if (s.status === 'EXPIRED') {
+        stop(); save('pending', null); show('expired');
+      }
+    } catch (_) { /* network blip, keep polling */ }
+  }, POLL_MS);
+}
+
+function done(s, job) {
+  save('pending', null);
+  const lines = cartItems.map(i => `<div><span>${i.sku.replace(/_/g,' ')} × ${i.qty}</span><span>${money(i.price * i.qty)}</span></div>`).join('');
+  $('doneSummary').innerHTML = lines +
+    `<div><b>Total</b><b>${money(cartTotal)}</b></div>` +
+    `<div><span>Ref</span><span>${s.utr || order.order_id}</span></div>` +
+    (job ? `<div><span>Job</span><span>${job}</span></div>` : '');
+  show('done');
+}
+
+function startTimer(expiry) {
+  clearInterval(tickTimer);
+  const tick = () => {
+    const left = Math.max(0, Math.floor((expiry - Date.now()) / 1000));
+    $('timer').textContent = `(${Math.floor(left/60)}:${String(left%60).padStart(2,'0')})`;
+  };
+  tick(); tickTimer = setInterval(tick, 1000);
+}
+function stop() { clearInterval(pollTimer); clearInterval(tickTimer); }
+
+function reset() { order = null; Object.keys(qty).forEach(k => qty[k] = 0); renderItems(); show('cart'); }
+$('newBtn').onclick = reset;
+$('retryBtn').onclick = reset;
+
+/* ===== start ===== */
+$('mobile').value = load('mobile') || '';
+loadItems().then(() => {
+  // resume an unfinished payment after refresh
+  const p = load('pending');
+  if (p && p.order && new Date(p.order.expires_at) > new Date()) {
+    order = p.order; cartItems = p.items; cartTotal = p.total; showPay(order);
+  } else save('pending', null);
+});
+</script>
+</body>
+</html>
